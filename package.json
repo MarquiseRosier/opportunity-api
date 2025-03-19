@@ -1,0 +1,20 @@
+{
+  "name": "opportune",
+  "version": "1.0.0",
+  "description": "a project that scans websites for defects that may impact conversions using RUM",
+  "main": "index.js",
+  "scripts": {
+    "test": "node index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@git.corp.adobe.com:cas/opportune.git"
+  },
+  "keywords": [
+    "success",
+    "seo",
+    "cwv"
+  ],
+  "author": "Marquise Rosier",
+  "license": "ISC"
+}
