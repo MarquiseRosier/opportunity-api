@@ -16,5 +16,11 @@
     "cwv"
   ],
   "author": "Marquise Rosier",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "@google-cloud/bigquery": "^7.9.3",
+    "dotenv": "^16.4.7",
+    "jsdom": "^26.0.0",
+    "puppeteer": "^24.4.0"
+  }
 }
