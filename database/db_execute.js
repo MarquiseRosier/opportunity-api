@@ -31,21 +31,38 @@ import { getBigQueryClient } from "./bq_client.js";
         this.bigquery = await getBigQueryClient(this.secrets)
     }
     
-    /**
-     * function will execute query and return array of results
-     * @param {string} query 
-     * @param {Array<string>} params 
-     * @returns {Array<object>}
-     */
-    async execute_query(query, params) {
-        return new Promise((resolve, reject) => {
-            this.bigquery.query({ query: [query], params: params }, (err, rows) => {
-                if (err) {
-                    reject({ status: '500', message: `query failed for ${err}` });
-                } else {
-                    resolve(rows);
-                }
-            });
+/**
+ * Executes a BigQuery SQL query with named parameters
+ * @param {string} query - SQL query with named placeholders (e.g. @userId)
+ * @param {Object} params - Object with named parameters (e.g. { userId: 'abc123' })
+ * @returns {Promise<Array<object>>}
+ */
+async execute_query(query, params = {}) {
+
+    console.log('🧠 Debug SQL:\n' + substituteParams(query, params));
+    return new Promise((resolve, reject) => {
+        const queryOptions = {
+            query: query,
+            params: params,
+            location: 'US', // or your region
+            parameterMode: 'named', // Use named parameters like @foo
+        };
+
+        this.bigquery.query(queryOptions, (err, rows) => {
+            if (err) {
+                reject({ status: 500, message: `Query failed: ${err.message}` });
+            } else {
+                resolve(rows);
+            }
         });
+    });}
+}
+
+function substituteParams(query, params = {}) {
+    let substituted = query;
+    for (const [key, value] of Object.entries(params)) {
+        const val = typeof value === 'string' ? `'${value}'` : value;
+        substituted = substituted.replace(new RegExp(`@${key}\\b`, 'g'), val);
     }
+    return substituted;
 }

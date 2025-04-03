@@ -12,140 +12,220 @@
 
 import fs from 'fs-extra';
 import path from 'path';
-import puppeteer from 'puppeteer';
-import { JSDOM } from 'jsdom'
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import pLimit from 'p-limit';
 
-/**
- * reads a query file and loads it into memory
- *
- * @param {string} query name of the query file
- */
+puppeteer.use(StealthPlugin());
+
+const SNAPSHOT_CONCURRENCY = 5;
+const snapshotLimit = pLimit(SNAPSHOT_CONCURRENCY);
+
 export async function loadQuery(query) {
     const pathName = path.resolve(process.cwd(), 'database', 'queries', `${query.replace(/^\//, '')}.sql`);
     return new Promise(((resolve, reject) => {
         fs.readFile(pathName, (err, data) => {
-        if (err) {
-            reject(`Failed to load .sql file ${pathName}`);
-        } else {
-            resolve(data.toString('utf8'));
-        }
+            if (err) {
+                reject(`Failed to load .sql file ${pathName}`);
+            } else {
+                resolve(data.toString('utf8'));
+            }
         });
     }));
 }
 
-/**
- * open a web page using puppeteer
- * @param {*} url 
- */
-export async function openPage(url) {
-    const browser = await puppeteer.launch({
-        headless: false,  // 👀 Run with a visible browser
-    });
+export async function openPage(url, browser) {
     const page = await browser.newPage();
-    await page.goto(url, { waitUntil: 'domcontentloaded' }); // Ensure DOM is loaded
 
-   return { browser, page }
+    try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 128000 });
+        return { browser, page };
+    } catch (err) {
+        console.warn(` Skipping URL due to error: ${url}\nReason: ${err.message}`);
+        return null;
+    }
 }
 
-/**
- * 
- * @param {*} dom 
- * @param {*} source 
- * @param {*} target 
- */
-export async function getBoundingBoxes(page, source, target) {
-    return await page.evaluate(({ source, target }) => {
-        const result = {};
+export async function getBoundingBoxes(page, source, target, url, click_frequency) {
+    const { sourceBoxes, targetBoxes } = await page.evaluate(({ source, target, url, click_frequency }) => {
+        function isValidSelector(selector) {
+            try { document.querySelectorAll(selector); return true; } catch { return false; }
+        }
 
         function isVisible(el) {
-            const bbx = el.getBoundingClientRect();
-
-            const inViewport =
-                bbx.width > 0 &&
-                bbx.height > 0 &&
-                bbx.bottom > 0 &&
-                bbx.right > 0 &&
-                bbx.top < window.innerHeight &&
-                bbx.left < window.innerWidth;
-
             const style = window.getComputedStyle(el);
-            const isHidden =
-                style.display === "none" ||
-                style.visibility === "hidden" ||
-                style.opacity === "0";
-
-            const hasZeroSize = el.offsetWidth === 0 || el.offsetHeight === 0;
-
-            const centerX = bbx.left + bbx.width / 2;
-            const centerY = bbx.top + bbx.height / 2;
-            const topElement = document.elementFromPoint(centerX, centerY);
-            const isObstructed = topElement && topElement !== el;
-
-            return !isHidden && !hasZeroSize
+            return !(style.display === "none" || style.visibility === "hidden" || style.opacity === "0") &&
+                !(el.offsetWidth === 0 || el.offsetHeight === 0);
         }
 
-        const sourceElements = document.querySelectorAll(source);
-        console.log(`Checking source elements:`, sourceElements);
-
-        if (sourceElements.length > 0) {
-            result.sources = Array.from(sourceElements)
-                .filter(isVisible)  //Only include visible elements
-                .map(el => {
-                    const bbx = el.getBoundingClientRect();
-                    console.log(`Visible BBX for ${source}:`, bbx);
-                    return {
-                        ...bbx.toJSON(),
-                        selector: el.id
-                            ? `#${el.id}` // If an ID exists, prefix it with #
-                            : el.className
-                            ? `.${el.className.split(" ").join(".")}` // If a class exists, prefix with .
-                            : "No Selector" // Fallback if neither exist
-                    };                });
-        } else {
-            result.sources = [];
-            console.warn(`No visible elements found for selector: ${source}`);
+        function getZInfo(el) {
+            const style = window.getComputedStyle(el);
+            const z = isNaN(parseInt(style.zIndex)) ? null : parseInt(style.zIndex);
+            return { zIndex: z, position: style.position };
         }
 
-        result.targets = [];
-        target.forEach(targ => {
-            const targetElements = document.querySelectorAll(targ);
-            console.log(`Checking target elements for ${targ}:`, targetElements);
+        function isOnTop(el) {
+            const bbx = el.getBoundingClientRect();
+            const points = [
+                [bbx.left + 1, bbx.top + 1],
+                [bbx.right - 1, bbx.top + 1],
+                [bbx.left + 1, bbx.bottom - 1],
+                [bbx.right - 1, bbx.bottom - 1],
+                [bbx.left + bbx.width / 2, bbx.top + bbx.height / 2]
+            ];
+            return points.every(([x, y]) => {
+                const topEl = document.elementFromPoint(x, y);
+                return topEl === el || el.contains(topEl);
+            });
+        }
 
-            const visibleTargets = Array.from(targetElements)
-                .filter(isVisible) 
+        function getSelector(el) {
+            if (el.id) return `#${el.id}`;
+            if (el.className) return "." + el.className.toString().trim().split(/\s+/).join(".");
+            return "No Selector";
+        }
+
+        function process(selector, label) {
+            if (!isValidSelector(selector)) return [];
+            return Array.from(document.querySelectorAll(selector))
+                .filter(isVisible)
+                .filter(isOnTop)
                 .map(el => {
                     const bbx = el.getBoundingClientRect();
-                    console.log(`Visible BBX for ${targ}:`, bbx);
                     return {
+                        selector: getSelector(el),
+                        role: label,
+                        url,
+                        click_frequency,
                         ...bbx.toJSON(),
-                        selector: el.id
-                            ? `#${el.id}` 
-                            : el.className
-                            ? `.${el.className.split(" ").join(".")}` 
-                            : "No Selector" 
+                        ...getZInfo(el)
                     };
                 });
+        }
 
-            result.targets.push(...visibleTargets); 
-        });
+        const sourceBoxes = process(source, "source");
+        let targetBoxes = [];
+        if (Array.isArray(target)) {
+            target.forEach(t => {
+                targetBoxes.push(...process(t, "target"));
+            });
+        }
 
-        return result;
-    }, { source, target });
+        return { sourceBoxes, targetBoxes };
+    }, { source, target, url, click_frequency });
+
+    const PADDING = 20;
+
+    const snapshotElements = async (boxes) => {
+        const results = await Promise.all(
+            boxes.map(box => snapshotLimit(async () => {
+                if (box.width > 0 && box.height > 0) {
+                    try {
+                        const snapshot = await page.screenshot({
+                            clip: {
+                                x: Math.max(0, box.x - PADDING),
+                                y: Math.max(0, box.y - PADDING),
+                                width: box.width + PADDING * 2,
+                                height: box.height + PADDING * 2
+                            },
+                            type: 'jpeg',
+                            encoding: 'base64'
+                        });
+                        return { ...box, snapshot: `data:image/jpeg;base64,${snapshot}` };
+                    } catch (err) {
+                        console.warn(` Failed to capture snapshot for ${box.selector}:`, err.message);
+                        return box;
+                    }
+                } else {
+                    return box;
+                }
+            }))
+        );
+        return results;
+    };
+
+    const sources = await snapshotElements(sourceBoxes);
+    const targets = await snapshotElements(targetBoxes);
+
+    if (sources.length === 0 && targets.length === 0) return null;
+
+    return { sources, targets };
 }
 
 export async function removeZeros(obj) {
-    const res = []
+    const res = [];
 
     obj.forEach((graph) => {
-        const subRes = []
+        if (!graph) return;
 
-        const { sources, targets } = graph;
-        const srcFiltered = Object.values(sources).filter(objRect => !Object.values(objRect).every(value => value === 0))
-        const trgFiltered = Object.values(targets).filter(objRect => !Object.values(objRect).every(value => value === 0))
+        const subRes = [];
+        const { sources, targets, url } = graph;
 
-        subRes.push({sources: srcFiltered, targets: trgFiltered})
+        const srcFiltered = (sources || []).filter(objRect => !Object.values(objRect).every(val => val === 0));
+        const trgFiltered = (targets || []).filter(objRect => !Object.values(objRect).every(val => val === 0));
 
-        res.push(subRes)
-    })
+        if (srcFiltered.length === 0 && trgFiltered.length === 0) return;
+
+        subRes.push({ sources: srcFiltered, targets: trgFiltered, url });
+        res.push(subRes);
+    });
+
     return res;
+}
+
+export function findIntersections(sources = [], targets = []) {
+    const intersects = [];
+
+    for (const source of sources) {
+        for (const target of targets) {
+            const doesIntersect = !(
+                source.right < target.left ||
+                source.left > target.right ||
+                source.bottom < target.top ||
+                source.top > target.bottom
+            );
+
+            if (doesIntersect) {
+                intersects.push({
+                    source: source.selector,
+                    target: target.selector,
+                    sourceBox: source,
+                    targetBox: target
+                });
+            }
+        }
+    }
+
+    return intersects;
+}
+
+export function collectConsoleMessages(page) {
+    const logs = [];
+
+    page.on('console', (msg) => {
+        try {
+            const type = msg.type();
+            const text = msg.text();
+
+            if (type === 'error') {
+                const locations = msg.location?.url
+                    ? [`${msg.location.url}:${msg.location.lineNumber}`]
+                    : [...text.matchAll(/(https?:\/\/\S+|\b\w+\.js:\d+)/g)].map(m => m[0]);
+
+                logs.push({
+                    type,
+                    message: text,
+                    files: locations
+                });
+            }
+        } catch (err) {
+            logs.push({
+                type: 'error',
+                message: 'Failed to capture console message',
+                files: []
+            });
+        }
+    });
+
+    return logs;
 }
